@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+baseline_corrected/
+*.csv
+*.png
+*.txt
