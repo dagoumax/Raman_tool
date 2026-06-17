@@ -215,21 +215,17 @@ class IncrementalSmoother:
 
 
 class TwoStageFilter:
-    """两级自适应滤波：3点中值 -> 自适应指数平滑
-    delta_display = |median - display|
-    delta_rate    = |median - last_median|
-    delta = max(delta_display, delta_rate)
-    alpha = alpha_min + (alpha_max - alpha_min) * delta / (delta + K)
+    """两级自适应滤波：5点中值 -> 分段自适应指数平滑
+    delta = |median - display|
+    delta < 0.03       -> alpha = 0.03
+    0.03 <= delta < 0.10 -> alpha = 0.12
+    delta >= 0.10      -> alpha = 0.65
     """
 
-    def __init__(self, alpha_min=0.03, alpha_max=0.90, K=0.05, median_win=3):
-        self.alpha_min = alpha_min
-        self.alpha_max = alpha_max
-        self.K = K
+    def __init__(self, median_win=5):
         self.median_win = median_win
         self._buf = []           # median buffer
         self.display = 0.0       # current display value
-        self._last_median = 0.0  # previous median for delta_rate
         self._initialized = False
         self.history = []        # raw inputs
         self.smoothed = []       # output values
@@ -247,28 +243,26 @@ class TwoStageFilter:
         if len(self._buf) > self.median_win:
             self._buf.pop(0)
 
-        # Stage 1: median
-        if not self._buf:
-            median_val = value
-        else:
-            s = sorted(self._buf)
-            n = len(s)
-            median_val = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+        # Stage 1: median (window=5)
+        s = sorted(self._buf)
+        n = len(s)
+        median_val = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
 
-        # Stage 2: adaptive exponential
+        # Stage 2: segmented adaptive exponential
         if not self._initialized:
             self.display = median_val
-            self._last_median = median_val
             self._initialized = True
             alpha = 1.0
         else:
-            delta_display = abs(median_val - self.display)
-            delta_rate = abs(median_val - self._last_median)
-            delta = max(delta_display, delta_rate)
-            alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * delta / (delta + self.K)
+            delta = abs(median_val - self.display)
+            if delta < 0.03:
+                alpha = 0.03
+            elif delta < 0.10:
+                alpha = 0.12
+            else:
+                alpha = 0.65
             self.display = alpha * median_val + (1.0 - alpha) * self.display
 
-        self._last_median = median_val
         self.smoothed.append(self.display)
         self.emas.append(median_val)
         self.mas.append(0.0)
