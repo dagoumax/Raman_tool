@@ -92,6 +92,7 @@ def arPLS(y, lam=1e5, max_iter=50, tol=1e-6):
 # ============================================================
 DEFAULT_CONFIG = {
     "input_format": "sif", "strategy": "peak_area",
+    "filter_type": "adaptive_ema",
     "coeff_a": 1.0, "coeff_b": 1.0, "coeff_c": 1.0,
     "o2_center": 1555.0, "o2_half_width": 25.0,
     "n2_center": 2330.0, "n2_half_width": 20.0,
@@ -211,6 +212,64 @@ class IncrementalSmoother:
         rw = self.history[-30:]; rst = float(np.std(rw, ddof=1)) if len(rw) >= 2 else 1e-8
         S = abs(raw - self.ema_slow) / max(rst, 1e-8)
         return 1.0 / (1.0 + np.exp(-3.0 * (S - adapt_threshold)))
+
+
+class TwoStageFilter:
+    """两级自适应滤波：3点中值 -> 自适应指数平滑
+    alpha = alpha_min + (alpha_max - alpha_min) * delta / (delta + K)
+    """
+
+    def __init__(self, alpha_min=0.03, alpha_max=0.80, K=5.0, median_win=3):
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        self.K = K
+        self.median_win = median_win
+        self._buf = []        # median buffer
+        self.display = 0.0    # current display value
+        self._initialized = False
+        self.history = []     # raw inputs
+        self.smoothed = []    # output values
+        self.emas = []        # placeholder: median output (stage1)
+        self.mas = []         # placeholder: 0
+        self.w_raws = []      # effective alpha
+
+    def update(self, value):
+        self.add(value)  # alias for pipeline compatibility
+        return self.display
+
+    def add(self, value, *args, **kwargs):
+        self.history.append(value)
+        self._buf.append(value)
+        if len(self._buf) > self.median_win:
+            self._buf.pop(0)
+
+        # Stage 1: median
+        if not self._buf:
+            median_val = value
+        else:
+            sorted_buf = sorted(self._buf)
+            n = len(sorted_buf)
+            if n % 2 == 1:
+                median_val = sorted_buf[n // 2]
+            else:
+                median_val = (sorted_buf[n // 2 - 1] + sorted_buf[n // 2]) / 2.0
+
+        # Stage 2: adaptive exponential
+        if not self._initialized:
+            self.display = median_val
+            self._initialized = True
+            alpha = 1.0
+        else:
+            delta = abs(median_val - self.display)
+            alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * delta / (delta + self.K)
+            self.display = alpha * median_val + (1.0 - alpha) * self.display
+
+        self.smoothed.append(self.display)
+        self.emas.append(median_val)
+        self.mas.append(0.0)
+        self.w_raws.append(alpha)
+        return self.display
+
 
 # ============================================================
 def process_single_file(filepath, config):
@@ -383,6 +442,10 @@ class RamanApp:
         self.co2_center_var = tk.StringVar(value=str(self.config["co2_center"])); ttk.Entry(gd, textvariable=self.co2_center_var, width=10).grid(row=3, column=1, padx=5)
         self.co2_hw_var = tk.StringVar(value=str(self.config["co2_half_width"])); ttk.Entry(gd, textvariable=self.co2_hw_var, width=10).grid(row=3, column=2, padx=5)
         smf = ttk.LabelFrame(cf, text="", padding=3); smf.pack(fill=tk.X, pady=3)
+        fs = ttk.Frame(smf); fs.pack(fill=tk.X, pady=1)
+        ttk.Label(fs, text="Filter:").pack(side=tk.LEFT)
+        self.filter_var = tk.StringVar(value=self.config["filter_type"])
+        ttk.Combobox(fs, textvariable=self.filter_var, values=["adaptive_ema", "two_stage"], state="readonly", width=14).pack(side=tk.LEFT, padx=5)
         s0 = ttk.Frame(smf); s0.pack(fill=tk.X, pady=1)
         ttk.Label(s0, text="Alpha(EMA):").pack(side=tk.LEFT)
         self.alpha_var = tk.StringVar(value=str(self.config["alpha"])); ttk.Entry(s0, textvariable=self.alpha_var, width=8).pack(side=tk.LEFT, padx=2)
@@ -462,6 +525,7 @@ class RamanApp:
     def _collect_config(self):
         rs = self.strategy_var.get(); st = self._sd.get(rs, rs)
         return {"input_format":self.fmt_var.get(),"strategy":st,
+            "filter_type":self.filter_var.get(),
             "coeff_a":self._float_or(self.coeff_a_var.get(),1.0),"coeff_b":self._float_or(self.coeff_b_var.get(),1.0),"coeff_c":self._float_or(self.coeff_c_var.get(),1.0),
             "o2_center":self._float_or(self.o2_center_var.get(),1555.0),"o2_half_width":self._float_or(self.o2_hw_var.get(),25.0),
             "n2_center":self._float_or(self.n2_center_var.get(),2330.0),"n2_half_width":self._float_or(self.n2_hw_var.get(),20.0),
@@ -473,6 +537,7 @@ class RamanApp:
 
     def _apply_config(self, config):
         self.fmt_var.set(config.get("input_format","sif"))
+        self.filter_var.set(config.get("filter_type","adaptive_ema"))
         s = config.get("strategy","peak_area"); self.strategy_var.set(self._sr.get(s,s))
         self.coeff_a_var.set(str(config.get("coeff_a",1.0))); self.coeff_b_var.set(str(config.get("coeff_b",1.0))); self.coeff_c_var.set(str(config.get("coeff_c",1.0)))
         self.o2_center_var.set(str(config.get("o2_center",1555.0))); self.o2_hw_var.set(str(config.get("o2_half_width",25.0)))
@@ -513,7 +578,10 @@ class RamanApp:
         fl = sorted([os.path.join(idir,f) for f in os.listdir(idir) if f.lower().endswith(ext)])
         if not fl: messagebox.showwarning("",""); return
         self.config = config; self.raw_o2_list.clear(); self.raw_n2_list.clear(); self.raw_co2_list.clear()
-        self.o2_smoother=IncrementalSmoother(); self.n2_smoother=IncrementalSmoother(); self.co2_smoother=IncrementalSmoother()
+        if config.get("filter_type") == "two_stage":
+            self.o2_smoother=TwoStageFilter(); self.n2_smoother=TwoStageFilter(); self.co2_smoother=TwoStageFilter()
+        else:
+            self.o2_smoother=IncrementalSmoother(); self.n2_smoother=IncrementalSmoother(); self.co2_smoother=IncrementalSmoother()
         self.smoothed_o2_list.clear(); self.smoothed_n2_list.clear(); self.smoothed_co2_list.clear()
         self.file_labels.clear(); self.processed_count = 0
         self._stop_event.clear(); self._result_queue = queue.Queue(); self._user_zoomed = False
