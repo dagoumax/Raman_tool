@@ -215,15 +215,15 @@ class IncrementalSmoother:
 
 
 class TwoStageFilter:
-    """两级自适应滤波：5点中值 -> 分段自适应指数平滑
-    delta = |median - display|
-    delta < 0.03       -> alpha = 0.03
-    0.03 <= delta < 0.10 -> alpha = 0.12
-    delta >= 0.10      -> alpha = 0.65
+    """两级自适应滤波：5点中值 -> 自适应指数平滑
+    alpha = alpha_min + (alpha_max - alpha_min) * (1 - exp(-delta / K))
     """
 
-    def __init__(self, median_win=5):
+    def __init__(self, median_win=5, alpha_min=0.02, alpha_max=0.75, K=0.10):
         self.median_win = median_win
+        self.alpha_min = alpha_min
+        self.alpha_max = alpha_max
+        self.K = K
         self._buf = []           # median buffer
         self.display = 0.0       # current display value
         self._initialized = False
@@ -248,19 +248,14 @@ class TwoStageFilter:
         n = len(s)
         median_val = s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
 
-        # Stage 2: segmented adaptive exponential
+        # Stage 2: exponential-driven adaptive alpha
         if not self._initialized:
             self.display = median_val
             self._initialized = True
             alpha = 1.0
         else:
             delta = abs(median_val - self.display)
-            if delta < 0.03:
-                alpha = 0.03
-            elif delta < 0.10:
-                alpha = 0.12
-            else:
-                alpha = 0.65
+            alpha = self.alpha_min + (self.alpha_max - self.alpha_min) * (1.0 - np.exp(-delta / self.K))
             self.display = alpha * median_val + (1.0 - alpha) * self.display
 
         self.smoothed.append(self.display)
